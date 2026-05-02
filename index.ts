@@ -66,11 +66,24 @@ let myDid: string = "";
 let settings: NostrSettings;
 let relayUrls: string[] = [];
 let pubkey: string = "";
+let configured: boolean = false;
+
+/**
+ * Check whether a template variable has been filled in.
+ * Returns false for the placeholder sentinel, empty strings, or whitespace.
+ */
+function isTemplateVarFilled(value: string): boolean {
+    if (!value) return false;
+    const trimmed = value.trim();
+    return trimmed !== "" && trimmed !== "<to-be-filled>";
+}
 
 /**
  * Parse relay URLs from the template variable.
+ * Returns an empty array if the value is still the placeholder.
  */
 function parseRelayUrls(): string[] {
+    if (!isTemplateVarFilled(NOSTR_RELAY_URLS)) return [];
     try {
         const parsed = JSON.parse(NOSTR_RELAY_URLS);
         if (Array.isArray(parsed)) return parsed;
@@ -122,6 +135,23 @@ const language = defineLanguage({
         relayUrls = parseRelayUrls();
         pubkey = NOSTR_PUBKEY || "";
 
+        // Check whether critical template variables have been filled in
+        const hasNeighbourhood = isTemplateVarFilled(NOSTR_NEIGHBOURHOOD_ID);
+        const hasRelays = relayUrls.length > 0;
+        const hasPubkey = isTemplateVarFilled(NOSTR_PUBKEY);
+
+        if (!hasNeighbourhood || !hasRelays || !hasPubkey) {
+            console.warn(
+                `[nostr-link-language] init: template variables not configured ` +
+                `(neighbourhood=${hasNeighbourhood}, relays=${hasRelays}, pubkey=${hasPubkey}). ` +
+                `Language will remain inactive until properly configured.`,
+            );
+            configured = false;
+            return;
+        }
+
+        configured = true;
+
         console.log(`[nostr-link-language] init: did=${myDid}, neighbourhood=${NOSTR_NEIGHBOURHOOD_ID}`);
         console.log(`[nostr-link-language] relays: ${relayUrls.join(", ")}`);
         console.log(`[nostr-link-language] sync mode: ${settings.syncMode}`);
@@ -158,6 +188,11 @@ const language = defineLanguage({
     // -----------------------------------------------------------------------
     commit: {
         async commit(diff: PerspectiveDiff) {
+            // If not configured, skip all relay interaction
+            if (!configured) {
+                return "";
+            }
+
             // 1. Store links locally
             store.applyDiff(diff);
 
@@ -238,7 +273,7 @@ const language = defineLanguage({
     // -----------------------------------------------------------------------
     sync: {
         async sync() {
-            if (settings.syncMode === "publish-only") {
+            if (!configured || settings.syncMode === "publish-only") {
                 return { additions: [], removals: [] };
             }
             return doSync(neighbourhoodUrl());
