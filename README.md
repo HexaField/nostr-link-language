@@ -9,6 +9,7 @@ AD4M link language that syncs Perspective triples to Nostr relays via kind:30078
 - **Query:** indexed local store (source, target, predicate)
 - **Native WebSocket:** direct Deno WebSocket connections to relays (no httpFetch)
 - **Cryptographic signing:** BIP-340 Schnorr signatures via `@noble/curves`
+- **Telepresence:** real-time presence via ephemeral events (kind 20042-20044, NIP-16), peer signalling and broadcast over WebSocket subscriptions
 
 ## Template Variables
 
@@ -35,7 +36,7 @@ Requires `@coasys/ad4m-ldk` at `../ad4m/ad4m-ldk/js/` or set `AD4M_LDK_ENTRY`.
 node --experimental-vm-modules --import tsx --test tests/*.test.ts
 ```
 
-222 tests across 10 suites.
+268 tests across 11 suites.
 
 ## Architecture
 
