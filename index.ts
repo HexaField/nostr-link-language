@@ -3,7 +3,7 @@
  *
  * Bridge language that syncs Perspectives via the Nostr relay network.
  * Implements perspective-commit, perspective-sync, perspective-query,
- * and peers capabilities.
+ * peers, and telepresence capabilities.
  *
  * **Self-contained**: Uses Deno-native WebSocket to connect directly to
  * Nostr relays. No executor extensions or signal-based delegation needed.
@@ -51,6 +51,18 @@ import { DenoRuntime } from "./src/runtime-deno.js";
 
 import type { SignedNostrEvent } from "./src/nostr-event.pure.js";
 import { initCryptoSigning, getPublicKey, canSign } from "./src/crypto.js";
+
+// Telepresence imports
+import { TELEPRESENCE_KINDS } from "./src/telepresence.pure.js";
+import {
+    initTelepresence,
+    handleTelepresenceEvent,
+    setOnlineStatus,
+    getOnlineAgents,
+    sendSignal,
+    sendBroadcast,
+    registerSignalCallback,
+} from "./src/telepresence.js";
 
 // ---------------------------------------------------------------------------
 // Template Variables (per Spec §9)
@@ -208,6 +220,17 @@ const language = defineLanguage({
             console.log(`[nostr-link-language] relay ${url}: ${status}${message ? ` (${message})` : ""}`);
         });
 
+        // Initialize telepresence
+        initTelepresence({
+            myDid,
+            pubkey,
+            neighbourhoodId: NOSTR_NEIGHBOURHOOD_ID,
+            writeRelays: writeRelays(),
+            finalizeEvent,
+            publishEvent,
+        });
+        console.log(`[nostr-link-language] telepresence: enabled`);
+
         // Subscribe to events if not in publish-only mode
         if (settings.syncMode !== "publish-only") {
             const lastRevision = store.getRevision();
@@ -228,6 +251,17 @@ const language = defineLanguage({
                 },
             );
         }
+
+        // Subscribe to telepresence ephemeral events (separate subscription)
+        subscribe(
+            NOSTR_NEIGHBOURHOOD_ID,
+            [...TELEPRESENCE_KINDS],
+            readRelays(),
+            undefined, // no since — ephemeral events aren't stored
+            (event: SignedNostrEvent) => {
+                handleTelepresenceEvent(event, NOSTR_NEIGHBOURHOOD_ID);
+            },
+        );
     },
 
     async teardown() {
@@ -389,6 +423,35 @@ const language = defineLanguage({
             return store.listPeers("peers/");
         },
     },
+
+    // -----------------------------------------------------------------------
+    // telepresence
+    // -----------------------------------------------------------------------
+    telepresence: {
+        async setOnlineStatus(status: unknown) {
+            if (!configured) return;
+            await setOnlineStatus(status);
+        },
+
+        async getOnlineAgents() {
+            if (!configured) return [];
+            return getOnlineAgents();
+        },
+
+        async sendSignal(remoteDid: string, payload: unknown) {
+            if (!configured) return { success: false, error: "not configured" };
+            return sendSignal(remoteDid, payload);
+        },
+
+        async sendBroadcast(payload: unknown) {
+            if (!configured) return { success: false, error: "not configured" };
+            return sendBroadcast(payload);
+        },
+
+        async registerSignalCallback(callback: any) {
+            await registerSignalCallback(callback);
+        },
+    },
 });
 
 // ---------------------------------------------------------------------------
@@ -410,6 +473,11 @@ export const {
     perspectiveQueryRun,
     peersSetLocal,
     peersRemote,
+    telepresenceSetOnlineStatus,
+    telepresenceGetOnlineAgents,
+    telepresenceSendSignal,
+    telepresenceSendBroadcast,
+    telepresenceRegisterSignalCallback,
 } = language;
 
 export default language;
