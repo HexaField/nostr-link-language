@@ -1,43 +1,38 @@
 /**
- * Relay communication via signal-based delegation.
+ * Relay communication via native WebSocket transport.
  *
- * Since httpFetch can't do WebSocket, relay communication uses signals:
- * - Outbound: emit signal { type: "nostr:publish", event, relays }
- * - Inbound: executor sends signals { type: "nostr:event", event }
- * - Subscription: emit signal { type: "nostr:subscribe", filter, relays }
+ * Uses the RelayTransport interface for direct WebSocket connections
+ * to Nostr relays. No signal delegation — fully self-contained.
  *
- * Uses injected runtime interface — no ad4m:host imports.
+ * Uses injected relay transport interface — no ad4m:host imports.
  */
 
 import type { SignedNostrEvent, NostrFilter } from "./nostr-event.pure.js";
-import { getRuntime } from "./runtime-interface.js";
+import { getRelayTransport } from "./transport.js";
 import { buildNeighbourhoodFilter, generateSubscriptionId } from "./relay.pure.js";
+import type { RelayEventCallback, RelayEoseCallback } from "./transport.js";
 
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
 let _subscriptionId: string | null = null;
+let _eventCallback: RelayEventCallback | null = null;
 
 // ---------------------------------------------------------------------------
 // Outbound: publish events to relays
 // ---------------------------------------------------------------------------
 
 /**
- * Publish a signed event to all write relays via signal delegation.
- *
- * The executor receives this signal, connects to the relays via WebSocket,
- * and publishes the event.
+ * Publish a signed event to all write relays via native WebSocket.
  */
 export function publishEvent(
     event: SignedNostrEvent,
     relayUrls: string[],
 ): void {
-    getRuntime().emitSignal(JSON.stringify({
-        type: "nostr:publish",
-        event,
-        relays: relayUrls,
-    }));
+    getRelayTransport().publish(event, relayUrls).catch(err => {
+        console.error("[relay] publish error:", err);
+    });
 }
 
 /**
@@ -53,46 +48,57 @@ export function publishEvents(
 }
 
 // ---------------------------------------------------------------------------
+// Connection management
+// ---------------------------------------------------------------------------
+
+/**
+ * Connect to relay URLs. Must be called before subscribe/publish.
+ */
+export function connectRelays(relayUrls: string[]): void {
+    getRelayTransport().connect(relayUrls);
+}
+
+// ---------------------------------------------------------------------------
 // Subscription management
 // ---------------------------------------------------------------------------
 
 /**
- * Request the executor to subscribe to events matching a filter on read relays.
- *
- * The executor will:
- * 1. Connect to the relays via WebSocket
- * 2. Send REQ with the subscription filter
- * 3. Forward matching events back as signals
+ * Subscribe to events matching a filter on read relays.
+ * Events are delivered directly to the provided callback.
  */
 export function subscribe(
     neighbourhoodId: string,
     kinds: number[],
     relayUrls: string[],
     since?: number,
+    onEvent?: RelayEventCallback,
+    onEose?: RelayEoseCallback,
 ): string {
     const subscriptionId = generateSubscriptionId();
     const filter = buildNeighbourhoodFilter(neighbourhoodId, kinds, since);
 
-    getRuntime().emitSignal(JSON.stringify({
-        type: "nostr:subscribe",
+    // Store the event callback for re-subscription
+    if (onEvent) {
+        _eventCallback = onEvent;
+    }
+
+    getRelayTransport().subscribe(
         subscriptionId,
-        filter,
-        relays: relayUrls,
-    }));
+        [filter],
+        onEvent || _eventCallback || (() => {}),
+        onEose,
+        relayUrls,
+    );
 
     _subscriptionId = subscriptionId;
     return subscriptionId;
 }
 
 /**
- * Request the executor to close a subscription.
+ * Close a subscription on all relays.
  */
 export function unsubscribe(subscriptionId: string, relayUrls: string[]): void {
-    getRuntime().emitSignal(JSON.stringify({
-        type: "nostr:unsubscribe",
-        subscriptionId,
-        relays: relayUrls,
-    }));
+    getRelayTransport().unsubscribe(subscriptionId, relayUrls);
 
     if (_subscriptionId === subscriptionId) {
         _subscriptionId = null;
@@ -112,7 +118,6 @@ export function getActiveSubscriptionId(): string | null {
 
 /**
  * Build the subscription filter for the current Neighbourhood.
- * Stored in settings so the executor knows what to subscribe to.
  */
 export function getSubscriptionFilter(
     neighbourhoodId: string,

@@ -1,27 +1,64 @@
 /**
- * secp256k1 Schnorr signing for Nostr events.
+ * Nostr event cryptography: ID computation and Schnorr signing.
  *
- * Nostr uses BIP-340 Schnorr signatures over secp256k1.
- * AD4M's signing adapter uses Ed25519 (different curve), so Nostr
- * signing requires a separate approach.
+ * Uses @noble/curves for BIP-340 Schnorr signatures over secp256k1.
+ * This is a pure JS implementation — no native deps needed.
  *
- * Strategy: The Neighbourhood's Nostr private key is stored in settings
- * (encrypted at rest). Actual signing is delegated to the executor via
- * signal-based communication. The executor has access to WebSocket and
- * can perform the signing using a full secp256k1 library.
- *
- * This module provides:
- * - Event ID computation (SHA-256 of canonical serialization) — fully implemented
- * - Signature creation via executor delegation (emitSignal)
- * - Signature verification structure
+ * The private key is provided via a template variable (NOSTR_PRIVKEY).
+ * If no private key is configured, events are published unsigned.
  *
  * Uses injected interfaces — no ad4m:host imports.
  */
 
-import { sha256Hex } from "./crypto.pure.js";
+import { sha256Hex, bytesToHex, hexToBytes } from "./crypto.pure.js";
 import type { UnsignedNostrEvent, SignedNostrEvent } from "./nostr-event.pure.js";
 import { serializeForId } from "./nostr-event.pure.js";
-import { getRuntime } from "./runtime-interface.js";
+import { schnorr } from "@noble/curves/secp256k1";
+
+// ---------------------------------------------------------------------------
+// Module state
+// ---------------------------------------------------------------------------
+
+let _privkeyBytes: Uint8Array | null = null;
+
+/**
+ * Initialize the signing module with a private key.
+ * The private key is a 32-byte hex string (64 chars).
+ */
+export function initCryptoSigning(privkeyHex: string | null): void {
+    if (privkeyHex && privkeyHex.length === 64 && /^[0-9a-f]+$/.test(privkeyHex)) {
+        _privkeyBytes = hexToBytes(privkeyHex);
+        console.log("[crypto] Schnorr signing initialized with private key");
+    } else if (privkeyHex) {
+        console.warn("[crypto] Invalid private key format (expected 64 hex chars). Signing disabled.");
+        _privkeyBytes = null;
+    } else {
+        console.log("[crypto] No private key provided. Events will be published unsigned.");
+        _privkeyBytes = null;
+    }
+}
+
+/**
+ * Check if signing is available.
+ */
+export function canSign(): boolean {
+    return _privkeyBytes !== null;
+}
+
+/**
+ * Get the public key corresponding to the configured private key.
+ * Returns null if no private key is configured.
+ */
+export function getPublicKey(): string | null {
+    if (!_privkeyBytes) return null;
+    try {
+        const pubkeyBytes = schnorr.getPublicKey(_privkeyBytes);
+        return bytesToHex(pubkeyBytes);
+    } catch (err) {
+        console.error("[crypto] Failed to derive public key:", err);
+        return null;
+    }
+}
 
 /**
  * Compute the event ID per NIP-01:
@@ -36,34 +73,28 @@ export async function computeEventId(
 }
 
 /**
- * Request the executor to sign a Nostr event via signal delegation.
+ * Finalize and sign a Nostr event.
  *
- * The executor manages the secp256k1 private key and WebSocket connections.
- * It receives the unsigned event, signs it, and sends back the signed
- * event via a return signal.
- *
- * Returns the event with id, pubkey, and sig fields populated by the
- * executor. In the meantime, returns a provisional event with empty sig
- * that can be used optimistically.
+ * If a private key is configured, produces a valid Schnorr signature.
+ * Otherwise, returns the event with an empty sig field.
  */
-export function requestEventSign(
+export async function finalizeAndSignEvent(
     event: UnsignedNostrEvent,
     pubkey: string,
-    eventId: string,
-): SignedNostrEvent {
-    // Emit signal requesting the executor to sign and publish
-    const signRequest = JSON.stringify({
-        type: "nostr:sign",
-        event: {
-            ...event,
-            id: eventId,
-            pubkey,
-        },
-    });
-    getRuntime().emitSignal(signRequest);
+): Promise<SignedNostrEvent> {
+    const eventId = await computeEventId(event, pubkey);
 
-    // Return the event with computed id and pubkey.
-    // The sig will be filled by the executor before publishing to relays.
+    let sig = "";
+    if (_privkeyBytes) {
+        try {
+            const idBytes = hexToBytes(eventId);
+            const sigBytes = schnorr.sign(idBytes, _privkeyBytes);
+            sig = bytesToHex(sigBytes);
+        } catch (err) {
+            console.error("[crypto] Signing failed:", err);
+        }
+    }
+
     return {
         id: eventId,
         pubkey,
@@ -71,16 +102,12 @@ export function requestEventSign(
         kind: event.kind,
         tags: event.tags,
         content: event.content,
-        sig: "", // Filled by executor
+        sig,
     };
 }
 
 /**
  * Verify a Nostr event's ID matches its serialized content.
- * This is the first layer of verification — checking structural integrity.
- *
- * Full Schnorr signature verification requires secp256k1 and is
- * delegated to the executor.
  */
 export async function verifyEventId(event: SignedNostrEvent): Promise<boolean> {
     const expectedId = await computeEventId(event, event.pubkey);
@@ -88,25 +115,20 @@ export async function verifyEventId(event: SignedNostrEvent): Promise<boolean> {
 }
 
 /**
- * Request the executor to verify a Nostr event's Schnorr signature.
- * Returns true optimistically if the event ID is valid — full sig
- * verification is handled by the executor.
+ * Verify a Nostr event: check ID and Schnorr signature.
  */
 export async function verifyEvent(event: SignedNostrEvent): Promise<boolean> {
-    // First check event ID integrity (we can do this ourselves)
     const idValid = await verifyEventId(event);
     if (!idValid) return false;
 
-    // If no sig, it's unsigned (e.g. from our own pending events)
-    if (!event.sig) return false;
+    if (!event.sig || event.sig.length !== 128) return false;
 
-    // Emit verification request for the executor
-    getRuntime().emitSignal(JSON.stringify({
-        type: "nostr:verify",
-        event,
-    }));
-
-    // We trust the event if the ID is correct — the executor will
-    // async-reject events with bad signatures via signal
-    return true;
+    try {
+        const sigBytes = hexToBytes(event.sig);
+        const idBytes = hexToBytes(event.id);
+        const pubkeyBytes = hexToBytes(event.pubkey);
+        return schnorr.verify(sigBytes, idBytes, pubkeyBytes);
+    } catch {
+        return false;
+    }
 }

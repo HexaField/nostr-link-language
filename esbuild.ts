@@ -8,6 +8,9 @@ const ad4mLdkEntry = "../ad4m/ad4m-ldk/js/lib/index.js";
 // Project root — only resolve .js→.ts within our own source tree
 const projectRoot = new URL(".", import.meta.url).pathname.replace(/\/$/, "");
 
+// Resolve @noble/* packages from node_modules (via pnpm symlinks)
+const nobleBasePath = resolve(projectRoot, "node_modules/@noble");
+
 const ad4mLdkAliasPlugin = {
   name: "ad4m-ldk-alias",
   setup(build: any) {
@@ -21,6 +24,31 @@ const ad4mLdkAliasPlugin = {
       path: ad4mLdkEntry,
       namespace: "file",
     }));
+    // Resolve @noble/curves/* to node_modules
+    build.onResolve({ filter: /^@noble\/curves/ }, (args: any) => {
+      const subpath = args.path.replace("@noble/curves", "");
+      let resolved: string;
+      if (!subpath || subpath === "/") {
+        resolved = resolve(nobleBasePath, "curves/secp256k1.js");
+      } else {
+        // e.g. @noble/curves/secp256k1 -> node_modules/@noble/curves/secp256k1.js
+        const sub = subpath.endsWith(".js") ? subpath : subpath + ".js";
+        resolved = resolve(nobleBasePath, "curves" + sub);
+      }
+      return { path: resolved, namespace: "file" };
+    });
+    // Resolve @noble/hashes/* to node_modules
+    build.onResolve({ filter: /^@noble\/hashes/ }, (args: any) => {
+      const subpath = args.path.replace("@noble/hashes", "");
+      let resolved: string;
+      if (!subpath || subpath === "/") {
+        resolved = resolve(nobleBasePath, "hashes/index.js");
+      } else {
+        const sub = subpath.endsWith(".js") ? subpath : subpath + ".js";
+        resolved = resolve(nobleBasePath, "hashes" + sub);
+      }
+      return { path: resolved, namespace: "file" };
+    });
   },
 };
 
@@ -32,9 +60,10 @@ const tsResolverPlugin = {
   setup(build: any) {
     build.onResolve({ filter: /\.js$/ }, (args: any) => {
       if (args.namespace !== "file" || !args.path.startsWith(".")) return;
-      // Only rewrite within our project tree
+      // Only rewrite within our project tree, NOT inside node_modules
       const resolveDir = args.resolveDir || ".";
       if (!resolveDir.startsWith(projectRoot)) return;
+      if (resolveDir.includes("node_modules")) return;
       const tsPath = args.path.replace(/\.js$/, ".ts");
       const resolved = resolve(resolveDir, tsPath);
       return { path: resolved, namespace: "file" };

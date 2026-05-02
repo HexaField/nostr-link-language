@@ -5,9 +5,17 @@
  * Implements perspective-commit, perspective-sync, perspective-query,
  * and peers capabilities.
  *
+ * **Self-contained**: Uses Deno-native WebSocket to connect directly to
+ * Nostr relays. No executor extensions or signal-based delegation needed.
+ *
  * Publishes links as Nostr events (kind 30078 for triples, kind 1 for
  * social text notes), processes inbound events from relay subscriptions,
  * and handles multi-relay deduplication.
+ *
+ * LIMITATION: Events are published without Schnorr signatures because
+ * secp256k1 is not available in the Deno runtime. Permissive relays
+ * (nostr-rs-relay in dev mode) accept unsigned events. Production use
+ * requires bundling a secp256k1 WASM module.
  *
  * Spec: nostr-link-language.md
  */
@@ -26,13 +34,14 @@ import type { NostrSettings } from "./src/settings.js";
 import { diffToEvents, linkContentKey } from "./src/translate.js";
 import { shouldFederate, linkOriginKey, isPredicateExcluded } from "./src/dual-language.js";
 import * as store from "./src/store.js";
-import { publishEvents } from "./src/relay.js";
+import { publishEvents, connectRelays } from "./src/relay.js";
 import { subscribe, unsubscribe, getActiveSubscriptionId } from "./src/relay.js";
-import { sync as doSync, handleInboundSignal, clearBuffer } from "./src/sync.js";
+import { sync as doSync, bufferEvent, clearBuffer } from "./src/sync.js";
+import { finalizeEvent } from "./src/nostr-event.js";
 
 // Adapter imports
-import { initTransport } from "./src/transport.js";
-import { DenoTransport } from "./src/transport-deno.js";
+import { initTransport, initRelayTransport } from "./src/transport.js";
+import { DenoTransport, DenoRelayTransport } from "./src/transport-deno.js";
 import { initStorage, getStorage } from "./src/storage-interface.js";
 import { DenoStorageAdapter } from "./src/storage-deno.js";
 import { initSigning } from "./src/signing-interface.js";
@@ -41,6 +50,7 @@ import { initRuntime } from "./src/runtime-interface.js";
 import { DenoRuntime } from "./src/runtime-deno.js";
 
 import type { SignedNostrEvent } from "./src/nostr-event.pure.js";
+import { initCryptoSigning, getPublicKey, canSign } from "./src/crypto.js";
 
 // ---------------------------------------------------------------------------
 // Template Variables (per Spec §9)
@@ -57,6 +67,9 @@ const NOSTR_PUBKEY = "<to-be-filled>";
 
 //!@ad4m-template-variable
 const NEIGHBOURHOOD_META = "<to-be-filled>";
+
+//!@ad4m-template-variable
+const NOSTR_PRIVKEY = "<to-be-filled>";
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -118,7 +131,7 @@ function neighbourhoodUrl(): string {
 
 const language = defineLanguage({
     name: "@hexafield/nostr-link-language",
-    version: "0.1.0",
+    version: "0.2.0",
 
     isPublic: true,
 
@@ -128,6 +141,14 @@ const language = defineLanguage({
         initStorage(new DenoStorageAdapter());
         initTransport(new DenoTransport());
         initSigning(new DenoSigningAdapter());
+
+        // Initialize the native WebSocket relay transport
+        const relayTransport = new DenoRelayTransport({
+            reconnectBaseMs: 1000,
+            reconnectMaxMs: 30000,
+        });
+        initRelayTransport(relayTransport);
+
         store.initStore();
 
         myDid = agentDid();
@@ -155,17 +176,56 @@ const language = defineLanguage({
         console.log(`[nostr-link-language] init: did=${myDid}, neighbourhood=${NOSTR_NEIGHBOURHOOD_ID}`);
         console.log(`[nostr-link-language] relays: ${relayUrls.join(", ")}`);
         console.log(`[nostr-link-language] sync mode: ${settings.syncMode}`);
-        console.log(`[nostr-link-language] pubkey: ${pubkey}`);
+        // Initialize Schnorr signing if private key is provided
+        const privkey = isTemplateVarFilled(NOSTR_PRIVKEY) ? NOSTR_PRIVKEY : null;
+        initCryptoSigning(privkey);
+
+        // If we have a private key, derive and verify pubkey
+        if (canSign()) {
+            const derivedPubkey = getPublicKey();
+            if (derivedPubkey && derivedPubkey !== pubkey) {
+                console.warn(
+                    `[nostr-link-language] WARNING: Derived pubkey ${derivedPubkey} ` +
+                    `does not match template pubkey ${pubkey}. Using derived pubkey.`
+                );
+                pubkey = derivedPubkey;
+            } else if (derivedPubkey) {
+                console.log(`[nostr-link-language] pubkey verified: ${pubkey}`);
+            }
+        } else {
+            console.log(`[nostr-link-language] pubkey: ${pubkey} (signing disabled — no private key)`);
+        }
+        console.log(`[nostr-link-language] transport: native WebSocket (self-contained)`);
+        console.log(`[nostr-link-language] signing: ${canSign() ? 'Schnorr (secp256k1)' : 'DISABLED (events will be unsigned)'}`);
+
+
+        // Connect to all relays via native WebSocket
+        const allRelays = [...new Set([...readRelays(), ...writeRelays()])];
+        connectRelays(allRelays);
+
+        // Register relay status logging
+        relayTransport.onStatus((url, status, message) => {
+            console.log(`[nostr-link-language] relay ${url}: ${status}${message ? ` (${message})` : ""}`);
+        });
 
         // Subscribe to events if not in publish-only mode
         if (settings.syncMode !== "publish-only") {
             const lastRevision = store.getRevision();
             const since = lastRevision ? parseInt(lastRevision, 10) : undefined;
+
+            // Events from relay subscriptions are buffered directly
             subscribe(
                 NOSTR_NEIGHBOURHOOD_ID,
                 settings.filter.kinds,
                 readRelays(),
                 since,
+                (event: SignedNostrEvent) => {
+                    // Buffer event for processing during sync()
+                    bufferEvent(event);
+                },
+                (subId: string) => {
+                    console.log(`[nostr-link-language] EOSE received for subscription ${subId}`);
+                },
             );
         }
     },
@@ -175,8 +235,18 @@ const language = defineLanguage({
         if (subId) {
             unsubscribe(subId, readRelays());
         }
+
+        // Close all relay connections
+        try {
+            const { getRelayTransport } = await import("./src/transport.js");
+            const transport = getRelayTransport();
+            transport.close();
+        } catch {
+            // Transport may not be initialized
+        }
+
         myDid = "";
-        console.log("[nostr-link-language] teardown");
+        console.log("[nostr-link-language] teardown: all relay connections closed");
     },
 
     interactions() {
@@ -246,17 +316,16 @@ const language = defineLanguage({
                 shouldFederate: shouldPublish,
             });
 
-            // 7. Publish to write relays via signal delegation
+            // 7. Finalize events (compute ID) and publish via native WebSocket
             if (events.length > 0) {
-                const signedEvents = events.map(e => ({
-                    id: "", // Filled by executor after signing
-                    pubkey,
-                    created_at: e.event.created_at,
-                    kind: e.event.kind,
-                    tags: e.event.tags,
-                    content: e.event.content,
-                    sig: "", // Filled by executor after signing
-                } as SignedNostrEvent));
+                const signedEvents: SignedNostrEvent[] = [];
+                for (const e of events) {
+                    const signed = await finalizeEvent(e.event, pubkey);
+                    signedEvents.push(signed);
+
+                    // Track event ID → link hash mapping
+                    store.setEventId(e.linkHash, signed.id);
+                }
 
                 publishEvents(signedEvents, writeRelays());
             }
@@ -368,14 +437,16 @@ export function linkSyncAddSyncStateChangeCallback(callback: (state: string) => 
 }
 
 // ---------------------------------------------------------------------------
-// Signal handler
+// Signal handler (legacy compatibility)
 // ---------------------------------------------------------------------------
 
 /**
  * Handle signals emitted by the executor.
  *
- * The executor forwards inbound Nostr events as signals:
- * { type: "nostr:event", event: <SignedNostrEvent> }
+ * LEGACY: With native WebSocket transport, events arrive directly via
+ * the relay transport's subscription callback. This handler is kept
+ * for backward compatibility with executors that still forward events
+ * as signals.
  */
 export async function handleSignal(signalData: string): Promise<void> {
     let signal: unknown;
@@ -385,6 +456,7 @@ export async function handleSignal(signalData: string): Promise<void> {
         return;
     }
 
+    const { handleInboundSignal } = await import("./src/sync.js");
     const result = handleInboundSignal(signal);
 
     if (result.kind === "ignored") {

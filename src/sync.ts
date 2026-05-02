@@ -1,11 +1,13 @@
 /**
  * Sync coordination module.
  *
- * Since Nostr has no HTTP polling fallback, sync() works by:
- * 1. Accumulating events received via handleSignal() between calls
- * 2. On sync(), drain the event buffer
- * 3. Translate events to links
- * 4. Deduplicate and return diff
+ * Events arrive via the relay transport's subscription callback
+ * (pushed directly by the native WebSocket connections).
+ *
+ * sync() works by:
+ * 1. Draining events accumulated in the buffer since last call
+ * 2. Translating events to links
+ * 3. Deduplicating and returning diff
  *
  * Uses injected interfaces — no ad4m:host imports.
  */
@@ -23,7 +25,7 @@ let _eventBuffer: SignedNostrEvent[] = [];
 
 /**
  * Add an event to the sync buffer.
- * Called by handleSignal() when the executor forwards Nostr events.
+ * Called by the relay transport subscription callback when events arrive.
  */
 export function bufferEvent(event: SignedNostrEvent): void {
     _eventBuffer.push(event);
@@ -115,6 +117,10 @@ export function sync(neighbourhoodUrl: string): PerspectiveDiff {
 
 /**
  * Process a single inbound signal from the executor.
+ *
+ * LEGACY: This is kept for backward compatibility with executors that
+ * still forward Nostr events as signals. The primary path is now
+ * via the relay transport's direct subscription callback.
  *
  * Returns: what happened (for logging/callbacks).
  */

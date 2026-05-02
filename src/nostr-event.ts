@@ -23,15 +23,15 @@ export {
 } from "./nostr-event.pure.js";
 
 import type { UnsignedNostrEvent, SignedNostrEvent } from "./nostr-event.pure.js";
-import { computeEventId, requestEventSign } from "./crypto.js";
+import { finalizeAndSignEvent } from "./crypto.js";
 
 /**
- * Create a signed event: compute ID and request executor signing.
+ * Finalize an event: compute ID, set pubkey, and sign with Schnorr
+ * if a private key is configured.
  */
 export async function finalizeEvent(
     event: UnsignedNostrEvent,
     pubkey: string,
 ): Promise<SignedNostrEvent> {
-    const eventId = await computeEventId(event, pubkey);
-    return requestEventSign(event, pubkey, eventId);
+    return finalizeAndSignEvent(event, pubkey);
 }
